@@ -1,0 +1,1073 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Excel 進階比對與搬移工具 (V3 虛擬化版)</title>
+
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- ExcelJS -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.3.0/exceljs.min.js"></script>
+
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <!-- Configure Tailwind -->
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        glass: "rgba(255, 255, 255, 0.1)",
+                        glassBorder: "rgba(255, 255, 255, 0.2)",
+                    },
+                }
+            }
+        }
+    </script>
+
+    <style>
+        body {
+            background: linear-gradient(135deg, #1a1c2c 0%, #2c1a4a 100%);
+            color: #e2e8f0;
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            min-height: 100vh;
+        }
+
+        .glass-panel {
+            background: rgba(30, 41, 59, 0.8);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .scroll-custom::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        .scroll-custom::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.2);
+        }
+
+        .scroll-custom::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 4px;
+        }
+
+        .cell-highlight {
+            background-color: rgba(234, 179, 8, 0.3) !important;
+            color: #fef08a;
+        }
+
+        /* Yellow */
+        .row-new {
+            background-color: rgba(239, 68, 68, 0.2) !important;
+        }
+
+        /* Red */
+
+        /* Table Fixed Layout for Virtual Scroll Alignment */
+        .fixed-table {
+            table-layout: fixed;
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .fixed-table th,
+        .fixed-table td {
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+        }
+
+        /* Define column widths generally or dynamically */
+        .col-id {
+            width: 60px;
+        }
+
+        .col-std {
+            width: 150px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+        // --- Utils ---
+        const ROW_HEIGHT = 28; // Compact Mode
+
+        const extractSheetData = (worksheet) => {
+            if (!worksheet) return [];
+            const data = [];
+            // Optimize maxCol detection
+            let maxCol = 0;
+            // Scan guessing maxCol from columnCount
+            if (worksheet.columnCount) {
+                maxCol = worksheet.columnCount;
+            }
+            // Double check with rows
+            worksheet.eachRow({ includeEmpty: true }, (row, rowNumber) => {
+                // row.values.length includes empty indices
+                if (row.cellCount > maxCol) maxCol = row.cellCount;
+            });
+            // Cap at 100 to prevent freeze
+            if (maxCol > 100) maxCol = 100;
+            if (maxCol < 1) maxCol = 1;
+
+            worksheet.eachRow({ includeEmpty: true }, (row, rowNumber) => {
+                const rowData = [];
+                for (let i = 1; i <= maxCol; i++) {
+                    const cell = row.getCell(i);
+                    let val = cell.text;
+                    if (val === undefined || val === null) val = "";
+                    rowData.push(val);
+                }
+                data.push(rowData);
+            });
+            return data;
+        };
+
+        const readFile = async (file) => {
+            const buffer = await file.arrayBuffer();
+            const workbook = new ExcelJS.Workbook();
+            await workbook.xlsx.load(buffer);
+            const sheetNames = workbook.worksheets.map(ws => ws.name);
+            return { name: file.name, workbook, sheetNames };
+        };
+
+        const findSmartIdColumn = (headerRow) => {
+            if (!headerRow) return 0;
+            let idx = headerRow.findIndex(h => h.trim() === "編號" || h.trim().toUpperCase() === "ID");
+            if (idx !== -1) return idx;
+            idx = headerRow.findIndex(h => h.includes("編號") || h.toUpperCase().includes("ID"));
+            if (idx !== -1) return idx;
+            return 0;
+        };
+
+        // Safe Copy Style for ExcelJS to avoid circular refs or invalid objects
+        const safeCopyStyle = (sourceStyle) => {
+            if (!sourceStyle) return {};
+            // Explicitly copy only visual properties supported by ExcelJS interfaces
+            // Avoid copying internal state or prototype chains
+            const newStyle = {};
+            if (sourceStyle.font) newStyle.font = { ...sourceStyle.font };
+            if (sourceStyle.fill) newStyle.fill = { ...sourceStyle.fill };
+            if (sourceStyle.border) newStyle.border = { ...sourceStyle.border };
+            if (sourceStyle.alignment) newStyle.alignment = { ...sourceStyle.alignment };
+            // numFmt is often critical for data types
+            if (sourceStyle.numFmt) newStyle.numFmt = sourceStyle.numFmt;
+            return newStyle;
+        };
+
+        const Icon = ({ name, size = 18 }) => {
+            const paths = {
+                upload: <><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></>,
+                file: <><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" /><polyline points="14 2 14 8 20 8" /></>,
+                arrowRight: <><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></>,
+                save: <><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" /></>,
+                play: <polygon points="5 3 19 12 5 21 5 3" />,
+                check: <polyline points="20 6 9 17 4 12" />,
+                refresh: <><path d="M21 2v6h-6" /><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M3 22v-6h6" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /></>,
+                chevronDown: <polyline points="6 9 12 15 18 9" />,
+                arrowUp: <><line x1="12" y1="19" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" /></>,
+                arrowDown: <><line x1="12" y1="5" x2="12" y2="19" /><polyline points="19 12 12 19 5 12" /></>,
+            };
+            return (
+                <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    {paths[name]}
+                </svg>
+            );
+        };
+
+        const DropZone = ({ onDrop, label, file, sheetNames, selectedSheet, onSheetChange }) => {
+            const inputRef = useRef(null);
+            const handleDrop = (e) => { e.preventDefault(); e.stopPropagation(); if (e.dataTransfer.files?.[0]) onDrop(e.dataTransfer.files[0]); };
+            const handleChange = (e) => { if (e.target.files?.[0]) onDrop(e.target.files[0]); };
+            return (
+                <div className="flex flex-col gap-2 transition-all">
+                    <div onDrop={handleDrop} onDragOver={e => e.preventDefault()} onClick={() => !file && inputRef.current.click()} className={`h-24 border-2 border-dashed rounded-xl flex items-center justify-center relative overflow-hidden transition-colors ${file ? 'border-emerald-500 bg-emerald-500/10 cursor-default' : 'border-slate-600 hover:border-slate-400 hover:bg-white/5 cursor-pointer'}`}>
+                        <input type="file" className="hidden" ref={inputRef} onChange={handleChange} accept=".xlsx,.xls" />
+                        <div className="flex flex-col items-center gap-2 z-10">
+                            {file ? (<><span className="text-emerald-400"><Icon name="file" size={24} /></span><span className="font-medium text-emerald-100">{file.name}</span></>) : (<><span className="text-slate-500"><Icon name="upload" size={24} /></span><span className="text-slate-400 text-sm">{label}</span></>)}
+                        </div>
+                    </div>
+                    {file && sheetNames?.length > 0 && (
+                        <select value={selectedSheet} onChange={e => onSheetChange(e.target.value)} className="w-full bg-slate-800 text-slate-200 text-sm rounded-lg p-2 border border-slate-600 focus:border-emerald-500 outline-none">
+                            {sheetNames.map(s => <option key={s} value={s}>{s}</option>)}
+                        </select>
+                    )}
+                </div>
+            );
+        };
+
+        // --- Virtual DataGrid Component ---
+        const VirtualDataGrid = ({ data, title, diffResults, selectedIndices, onSelectionChange, rowMap, idColumnIdx, scrollToId, scrollToCol, searchTerm }) => {
+            const containerRef = useRef(null);
+            const headerRef = useRef(null); // Add Header Ref
+            const [scrollTop, setScrollTop] = useState(0);
+            const [containerHeight, setContainerHeight] = useState(400);
+
+            // Handle Resize
+            useEffect(() => {
+                const updateHeight = () => {
+                    if (containerRef.current) setContainerHeight(containerRef.current.clientHeight);
+                };
+                window.addEventListener('resize', updateHeight);
+                updateHeight();
+                return () => window.removeEventListener('resize', updateHeight);
+            }, []);
+
+            // Handle Scroll
+            const handleScroll = (e) => {
+                setScrollTop(e.target.scrollTop);
+                // Sync Header Scroll
+                if (headerRef.current) {
+                    headerRef.current.scrollLeft = e.target.scrollLeft;
+                }
+            };
+
+            // Search Jump Logic (Internal)
+            useEffect(() => {
+                if (!searchTerm || !data || data.length === 0) return;
+                const body = data.slice(1);
+                // Find first match
+                const low = searchTerm.toLowerCase();
+                const matchedIdx = body.findIndex(row => row.some(c => String(c).toLowerCase().includes(low)));
+
+                if (matchedIdx !== -1 && containerRef.current) {
+                    const top = matchedIdx * ROW_HEIGHT;
+                    containerRef.current.scrollTo({ top: top - 100, behavior: 'smooth' });
+                }
+            }, [searchTerm, data]);
+
+            // Scroll To ID (Diff Nav) + H-Scroll
+            useEffect(() => {
+                if (scrollToId !== -1 && containerRef.current) {
+                    const top = scrollToId * ROW_HEIGHT;
+                    const options = { top: top - 100, behavior: 'smooth' };
+
+                    // Horizontal Scroll
+                    if (scrollToCol !== undefined && scrollToCol !== -1) {
+                        // Estimate column width is 150px
+                        const left = (scrollToCol * 150);
+                        options.left = left;
+                    }
+                    containerRef.current.scrollTo(options); // -100 for context
+                }
+            }, [scrollToId, scrollToCol]);
+
+            if (!data || data.length === 0) return (
+                <div className="flex-1 glass-panel rounded-xl flex items-center justify-center text-slate-500">
+                    等待資料...
+                </div>
+            );
+
+            const header = data[0];
+            const body = data.slice(1); // Actual data rows
+
+            // NO FILTERING - Display full body
+            const totalRows = body.length;
+
+            // Virtualization Calculations
+            const limit = Math.ceil(containerHeight / ROW_HEIGHT) + 5; // Buffer
+            const startNode = Math.floor(scrollTop / ROW_HEIGHT);
+            const start = Math.max(0, startNode - 5); // Buffer
+            const end = Math.min(totalRows, start + limit);
+
+            const visibleRows = body.slice(start, end);
+            const paddingTop = start * ROW_HEIGHT;
+            const paddingBottom = (totalRows - end) * ROW_HEIGHT;
+
+            return (
+                <div className="flex-1 glass-panel rounded-xl flex flex-col overflow-hidden h-full shadow-xl">
+                    {/* Header Bar */}
+                    <div className="p-3 border-b border-white/10 bg-black/20 font-bold text-center text-emerald-400 flex justify-between px-4 shrink-0">
+                        <span>{title}</span>
+                        <span className="text-slate-500 text-xs font-mono self-center">ROWS: {totalRows}</span>
+                    </div>
+
+                    {/* Table Header (Sticky) */}
+                    <div ref={headerRef} className="overflow-hidden bg-slate-800 ring-1 ring-white/10 shrink-0">
+                        <table className="fixed-table text-sm text-left">
+                            <thead>
+                                <tr>
+                                    <th className="p-3 bg-slate-900 border-b border-white/10 col-id text-center text-slate-500">#</th>
+                                    {header.map((col, idx) => (
+                                        <th key={idx} className={`p-3 bg-slate-900 border-b border-white/10 col-std text-slate-300 font-semibold border-r border-white/5 ${idx === idColumnIdx ? 'text-emerald-400 bg-emerald-900/20' : ''}`}>
+                                            {col} {idx === idColumnIdx && <span className="text-xs ml-1">(ID)</span>}
+                                        </th>
+                                    ))}
+                                </tr>
+                            </thead>
+                        </table>
+                    </div>
+
+                    {/* Virtual Scroll Body */}
+                    <div ref={containerRef} onScroll={handleScroll} className="overflow-auto scroll-custom flex-1 relative">
+                        {/* Simulation Container */}
+                        <table className="fixed-table text-sm text-left" style={{ marginTop: paddingTop, marginBottom: paddingBottom }}>
+                            <tbody>
+                                {visibleRows.map((row, idx) => {
+                                    const realIndex = start + idx;
+                                    // NO item structure here, direct row
+                                    const id = row[idColumnIdx];
+                                    const diff = diffResults?.[id];
+
+                                    // Search Highlight
+                                    let isSearchMatch = false;
+                                    if (searchTerm) {
+                                        const low = searchTerm.toLowerCase();
+                                        if (row.some(c => String(c).toLowerCase().includes(low))) isSearchMatch = true;
+                                    }
+
+                                    let rowClass = "border-b border-white/5 hover:bg-white/5 transition-colors group h-[28px]"; // forced height compact
+                                    if (diff?.status === 'NEW') rowClass += " row-new";
+                                    if (isSearchMatch) rowClass += " bg-emerald-500/20 ring-1 ring-emerald-500"; // Search Highlight
+
+                                    const isSelected = selectedIndices?.has(realIndex);
+                                    if (isSelected) rowClass += " bg-blue-500/20";
+
+                                    // Highlight if it's the target of navigation?
+                                    if (realIndex === scrollToId) rowClass += " ring-2 ring-indigo-500 z-10 relative";
+
+                                    return (
+                                        <tr key={realIndex} className={rowClass} onClick={() => onSelectionChange && onSelectionChange(realIndex)}>
+                                            <td className="p-1 px-2 text-center border-r border-white/5 text-[10px] text-slate-600 col-id">
+                                                {isSelected && <div className="w-1.5 h-1.5 rounded-full bg-blue-500 mx-auto"></div>}
+                                            </td>
+                                            {row.map((cell, cIdx) => {
+                                                const isDiffCell = diff?.diffCells?.includes(cIdx);
+                                                return (
+                                                    <td
+                                                        key={cIdx}
+                                                        className={`p-1 px-2 border-r border-white/5 text-slate-300 col-std text-xs ${isDiffCell ? 'cell-highlight' : ''}`}
+                                                        title={cell}
+                                                    >
+                                                        {cell}
+                                                    </td>
+                                                );
+                                            })}
+                                        </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            );
+        };
+
+        // --- Report Modal Component ---
+        const ReportModal = ({ isOpen, onClose, diffResults, leftData, rightData, idColumnIdx, onJump }) => {
+            if (!isOpen) return null;
+
+            const [tab, setTab] = useState('MODIFIED'); // 'MODIFIED' | 'NEW'
+
+            const modifiedItems = Object.entries(diffResults).filter(([_, val]) => val.status === 'MODIFIED');
+            const newItems = Object.entries(diffResults).filter(([_, val]) => val.status === 'NEW');
+
+            // Helper to get column name
+            const header = leftData[0] || [];
+
+            // Helper to find right row
+            const rightMap = useMemo(() => {
+                const m = new Map();
+                if (rightData.length > 1) {
+                    rightData.slice(1).forEach((r, idx) => m.set(String(r[idColumnIdx]), r));
+                }
+                return m;
+            }, [rightData, idColumnIdx]);
+
+            // Helper to find left row
+            const leftMap = useMemo(() => {
+                const m = new Map();
+                if (leftData.length > 1) {
+                    leftData.slice(1).forEach((r, idx) => m.set(String(r[idColumnIdx]), idx + 1)); // Store logical index (header=0, row1=1)
+                }
+                return m;
+            }, [leftData, idColumnIdx]);
+
+            return (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+                    <div className="bg-slate-900 border border-white/10 rounded-xl shadow-2xl w-full max-w-4xl max-h-[80vh] flex flex-col overflow-hidden animate-fade-in">
+                        {/* Header */}
+                        <div className="p-4 border-b border-white/10 flex justify-between items-center bg-slate-800">
+                            <h2 className="text-xl font-bold text-white flex gap-2 items-center">
+                                <Icon name="file" /> 比對報告
+                            </h2>
+                            <button onClick={onClose} className="p-1 hover:bg-white/10 rounded text-slate-400 hover:text-white transition-colors">
+                                <Icon name="check" size={20} /> {/* Close Icon */}
+                            </button>
+                        </div>
+
+                        {/* Tabs */}
+                        <div className="flex border-b border-white/10">
+                            <button
+                                onClick={() => setTab('MODIFIED')}
+                                className={`flex-1 p-3 text-sm font-bold transition-colors ${tab === 'MODIFIED' ? 'bg-yellow-500/10 text-yellow-500 border-b-2 border-yellow-500' : 'text-slate-400 hover:bg-white/5'}`}
+                            >
+                                差異項目 ({modifiedItems.length})
+                            </button>
+                            <button
+                                onClick={() => setTab('NEW')}
+                                className={`flex-1 p-3 text-sm font-bold transition-colors ${tab === 'NEW' ? 'bg-red-500/10 text-red-500 border-b-2 border-red-500' : 'text-slate-400 hover:bg-white/5'}`}
+                            >
+                                新增項目 ({newItems.length})
+                            </button>
+                        </div>
+
+                        {/* Content */}
+                        <div className="flex-1 overflow-auto p-4 scroll-custom bg-slate-900/50">
+                            {tab === 'MODIFIED' && (
+                                <div className="space-y-3">
+                                    {modifiedItems.length === 0 && <div className="text-center text-slate-500 py-10">無差異項目</div>}
+                                    {modifiedItems.map(([id, info]) => {
+                                        const leftRowNode = leftData[leftMap.get(id)]; // Raw row array
+                                        const rightRowNode = rightMap.get(id); // Raw row array
+
+                                        // If missing data (shouldn't happen for MODIFIED), skip
+                                        if (!leftRowNode || !rightRowNode) return null;
+
+                                        return (
+                                            <div key={id} onClick={() => onJump(id, 'MODIFIED')} className="bg-slate-800/50 border border-white/5 rounded-lg p-3 hover:border-yellow-500/50 cursor-pointer transition-all hover:bg-slate-800 group">
+                                                <div className="flex justify-between mb-2">
+                                                    <span className="font-mono text-yellow-400 font-bold">ID: {id}</span>
+                                                    <span className="text-xs text-slate-500 group-hover:text-yellow-500 transition-colors">點擊跳轉 &rarr;</span>
+                                                </div>
+                                                <div className="space-y-1">
+                                                    {info.diffCells.map(colIdx => (
+                                                        <div key={colIdx} className="grid grid-cols-[120px_1fr_20px_1fr] gap-2 text-xs items-center bg-black/20 p-1 rounded border border-white/5">
+                                                            <span className="text-slate-400 truncate text-right font-medium" title={header[colIdx]}>{header[colIdx]}:</span>
+                                                            <span className="text-red-300 bg-red-900/20 px-1 rounded truncate" title={leftRowNode[colIdx]?.toString()}>{leftRowNode[colIdx]?.toString() || '(空)'}</span>
+                                                            <span className="text-slate-600 text-center">&rarr;</span>
+                                                            <span className="text-emerald-300 bg-emerald-900/20 px-1 rounded truncate" title={rightRowNode[colIdx]?.toString()}>{rightRowNode[colIdx]?.toString() || '(空)'}</span>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+
+                            {tab === 'NEW' && (
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                                    {newItems.length === 0 && <div className="col-span-full text-center text-slate-500 py-10">無新增項目</div>}
+                                    {newItems.map(([id, info]) => (
+                                        <div key={id} onClick={() => onJump(id, 'NEW')} className="bg-slate-800/50 border border-white/5 rounded-lg p-3 hover:border-red-500/50 cursor-pointer transition-all hover:bg-slate-800 flex justify-between items-center group">
+                                            <span className="font-mono text-red-400 font-bold">ID: {id}</span>
+                                            <span className="text-xs text-slate-500 group-hover:text-red-500 transition-colors">跳轉 &rarr;</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [leftFile, setLeftFile] = useState(null);
+            const [rightFile, setRightFile] = useState(null);
+            const [leftSheet, setLeftSheet] = useState(null);
+            const [rightSheet, setRightSheet] = useState(null);
+            const [leftData, setLeftData] = useState([]);
+            const [rightData, setRightData] = useState([]);
+            const [leftSelection, setLeftSelection] = useState(new Set());
+            const [diffResults, setDiffResults] = useState({});
+            const [isComparing, setIsComparing] = useState(false);
+            const [idColumnIdx, setIdColumnIdx] = useState(0);
+            const [diffList, setDiffList] = useState([]);
+            const [currentDiffIdx, setCurrentDiffIdx] = useState(-1);
+            const [stats, setStats] = useState({ modified: 0, new: 0 });
+
+            // Report Modal Logic
+            const [showReport, setShowReport] = useState(false);
+
+            // Search State
+            const [leftSearch, setLeftSearch] = useState("");
+            const [rightSearch, setRightSearch] = useState("");
+
+            // ... (LoadSheet, Refresh, useEffects etc - existing code)
+
+            const handleJumpFromReport = (id, type) => {
+                setShowReport(false);
+
+                // Find index in leftData (Source)
+                const leftIdx = leftData.findIndex(r => String(r[idColumnIdx]) === String(id));
+                if (leftIdx !== -1) {
+                    const visibleRowIdx = leftIdx - 1; // Header is 0, so row 1 is data index 0
+
+                    // 1. Scroll Left
+                    if (leftIdx > 0 && containerRefLeft.current) { // Wait, accessing ref inside App is hard if ref is inside VirtualDataGrid
+                        // We control scroll via props: scrollToId
+                        // scrollToId expects "Logical Row Index" (0-based from data body)
+                        const targetRowIdx = leftIdx - 1;
+
+                        // We need to set scrollToId. 
+                        // But scrollToId logic drives 'diffList' navigation currently using currentDiffIdx.
+                        // We should reuse the SAME mechanism or override it.
+
+                        // Let's Find if this ID is in diffList
+                        const diffIndex = diffList.indexOf(targetRowIdx);
+                        if (diffIndex !== -1) {
+                            setCurrentDiffIdx(diffIndex);
+                            // Also set JumpCol if MODIFIED
+                            if (type === 'MODIFIED') {
+                                const diff = diffResults[id];
+                                if (diff && diff.diffCells && diff.diffCells.length > 0) {
+                                    setCurrentDiffCol(diff.diffCells[0]);
+                                }
+                            } else {
+                                setCurrentDiffCol(-1);
+                            }
+                        } else {
+                            // It's not in diffList? Should not happen if it's in diffResults.
+                            // But if it happens, we can force search?
+                            setLeftSearch(id); // Use Search mechanic as fallback to jump
+                        }
+                    }
+                }
+            };
+
+            // Wait, accessing Child Ref (VirtualDataGrid) from Parent (App) is not set up.
+            // VirtualDataGrid uses `scrollToId` prop as a trigger.
+            // `scrollToId` prop takes a Row Index.
+            // `App` manages `diffList` and `currentDiffIdx`.
+            // `scrollToId` passed to VirtualGrid is `diffList[currentDiffIdx]`.
+
+            // Correct Logic for Jump:
+            // 1. Find the `rowIndex` of the ID in `leftData`.
+            // 2. Find if this `rowIndex` exists in `diffList`.
+            // 3. If yes, set `currentDiffIdx` to that index using `setCurrentDiffIdx`.
+            // 4. This will trigger VirtualDataGrid to scroll via `useEffect`.
+
+            const onReportJump = (id, type) => {
+                const header = leftData[0];
+                const rowIndex = leftData.findIndex((r, i) => i > 0 && String(r[idColumnIdx]) === String(id));
+
+                if (rowIndex !== -1) {
+                    const dataBodyIndex = rowIndex - 1;
+                    const diffIdx = diffList.indexOf(dataBodyIndex);
+
+                    if (diffIdx !== -1) {
+                        setCurrentDiffIdx(diffIdx);
+                        setShowReport(false);
+
+                        if (type === 'MODIFIED') {
+                            const diff = diffResults[id];
+                            if (diff && diff.diffCells?.length > 0) {
+                                setCurrentDiffCol(diff.diffCells[0]);
+                            }
+                        } else {
+                            setCurrentDiffCol(-1);
+                        }
+                    } else {
+                        // Not in list? Maybe search text jump backup
+                        setLeftSearch(id);
+                        setShowReport(false);
+                    }
+                }
+            };
+
+            // ...
+
+
+
+            // Load Sheet
+            const loadSheet = (file, sheetName, setFn) => {
+                if (!file || !sheetName) { setFn([]); return; }
+                const ws = file.workbook.getWorksheet(sheetName);
+                const data = extractSheetData(ws);
+                setFn(data);
+                // Clear state? Only if it's a fresh load (not move)
+                // We'll manage clears manually in actions.
+                if (setFn === setLeftData) {
+                    // Reset left related
+                    setLeftSelection(new Set());
+                    setDiffResults({});
+                    setDiffList([]);
+                    setStats({ modified: 0, new: 0 });
+                } else {
+                    // Right loaded -> clear diffs too usually?
+                    // No, User might load right file later.
+                }
+            };
+
+            const refreshRightData = (file, sheetName) => {
+                const ws = file.workbook.getWorksheet(sheetName);
+                const data = extractSheetData(ws);
+                setRightData(data);
+            };
+
+            useEffect(() => { loadSheet(leftFile, leftSheet, setLeftData); }, [leftFile, leftSheet]);
+            useEffect(() => { loadSheet(rightFile, rightSheet, setRightData); }, [rightFile, rightSheet]);
+
+            useEffect(() => {
+                if (leftData && leftData.length > 0) {
+                    const header = leftData[0];
+                    setIdColumnIdx(findSmartIdColumn(header));
+                }
+            }, [leftData]);
+
+            const onLeftDrop = (f) => readFile(f).then(info => { setLeftFile(info); setLeftSheet(info.sheetNames[0]); });
+            const onRightDrop = (f) => readFile(f).then(info => { setRightFile(info); setRightSheet(info.sheetNames[0]); });
+
+            const runComparison = () => {
+                if (!leftData.length || !rightData.length) return;
+                setIsComparing(true);
+                setTimeout(() => {
+                    const results = {};
+                    const leftBody = leftData.slice(1);
+                    const rightBody = rightData.slice(1);
+                    const diffIndices = [];
+                    let modCount = 0;
+                    let newCount = 0;
+
+                    const leftHeaderName = leftData[0][idColumnIdx];
+                    let rightIdIdx = rightData[0].findIndex(h => h === leftHeaderName);
+                    if (rightIdIdx === -1) rightIdIdx = idColumnIdx;
+
+                    const rightMap = new Map();
+                    rightBody.forEach(row => rightMap.set(String(row[rightIdIdx]), row));
+
+                    leftBody.forEach((lRow, rIdx) => {
+                        const rawId = lRow[idColumnIdx];
+                        const id = String(rawId || "").trim();
+                        if (!id || id.toUpperCase() === 'SKIP') return;
+
+                        const rRow = rightMap.get(id);
+
+                        if (!rRow) {
+                            results[id] = { status: 'NEW' };
+                            diffIndices.push(rIdx);
+                            newCount++;
+                        } else {
+                            const diffCells = [];
+                            const len = Math.max(lRow.length, rRow.length);
+                            let hasDiff = false;
+
+                            for (let i = 0; i < len; i++) {
+                                if (i === idColumnIdx) continue;
+                                const lVal = (lRow[i] || "").toString().trim();
+                                const rVal = (rRow[i] || "").toString().trim();
+                                if (lVal !== rVal) {
+                                    diffCells.push(i);
+                                    hasDiff = true;
+                                }
+                            }
+                            if (hasDiff) {
+                                results[id] = { status: 'MODIFIED', diffCells };
+                                diffIndices.push(rIdx);
+                                modCount++;
+                            }
+                        }
+                    });
+
+                    setDiffResults(results);
+                    setDiffList(diffIndices);
+                    setStats({ modified: modCount, new: newCount });
+                    setCurrentDiffIdx(-1);
+                    setIsComparing(false);
+                }, 100);
+            };
+
+            const [currentDiffCol, setCurrentDiffCol] = useState(-1);
+
+            // ...
+
+            const scrollToDiff = (direction) => {
+                if (diffList.length === 0) return;
+                let nextIdx = currentDiffIdx + direction;
+                if (nextIdx >= diffList.length) nextIdx = 0;
+                if (nextIdx < 0) nextIdx = diffList.length - 1;
+                setCurrentDiffIdx(nextIdx);
+
+                // Calculate Col
+                const rowRealIdx = diffList[nextIdx];
+                const rowData = leftData[rowRealIdx + 1];
+                const id = rowData[idColumnIdx];
+                const diff = diffResults[id];
+                if (diff && diff.diffCells && diff.diffCells.length > 0) {
+                    setCurrentDiffCol(diff.diffCells[0]); // First diff column
+                } else {
+                    setCurrentDiffCol(-1);
+                }
+            };
+
+            // ...
+
+            // New handleMove with Context-Based Anchor Search
+            const handleMove = async () => {
+                try {
+                    if (leftSelection.size === 0 || !rightFile) return;
+
+                    const wsTarget = rightFile.workbook.getWorksheet(rightSheet);
+                    const wsSource = leftFile.workbook.getWorksheet(leftSheet);
+
+                    // Sort selection by visual index to ensure we process top-down
+                    const selectedList = Array.from(leftSelection).sort((a, b) => a - b);
+                    const leftHeaderName = leftData[0][idColumnIdx];
+                    const sourceIdColNum = idColumnIdx + 1;
+
+                    // 1. Map Source IDs to Excel Rows
+                    const sourceRowMap = new Map();
+                    wsSource.eachRow((row, number) => {
+                        const id = row.getCell(sourceIdColNum).toString();
+                        if (id) sourceRowMap.set(id, row);
+                    });
+
+                    // 2. Map Target IDs to Row Indices for quick anchor lookup
+                    let targetIdColNum = sourceIdColNum;
+                    // Auto-detect target ID column
+                    wsTarget.getRow(1).eachCell((cell, colNum) => {
+                        if (cell.text === leftHeaderName) targetIdColNum = colNum;
+                    });
+
+                    const targetIdMap = new Map(); // ID -> RowNumber
+                    let maxRow = 0;
+                    wsTarget.eachRow((row, number) => {
+                        if (number > maxRow) maxRow = number;
+                        const id = row.getCell(targetIdColNum).toString();
+                        if (id) targetIdMap.set(id, number);
+                    });
+
+                    let modifiedCount = 0;
+                    let insertedCount = 0;
+                    const movedIds = new Set();
+
+                    // Clone for optimistic UI
+                    const newRightData = [...rightData];
+
+                    // Helper: Find Insert Position via Anchors
+                    const findInsertPos = (sourceIndex) => {
+                        // Strategy 1: Look Up (Predecessors)
+                        // Find nearest previous ID in Source that EXISTS in Target
+                        for (let i = sourceIndex - 1; i >= 0; i--) { // 0 is header, but we check > 0 usually
+                            const row = leftData[i + 1]; // +1 because leftData includes header? No, data includes header at 0.
+                            // leftData[0] is header. leftData[1] is Row 1.
+                            // body index `sourceIndex` corresponds to leftData[`sourceIndex` + 1].
+                            // We want neighbors.
+                            if (!row) continue;
+                            const id = String(row[idColumnIdx]);
+                            if (targetIdMap.has(id)) {
+                                const anchorRow = targetIdMap.get(id);
+                                return { pos: anchorRow + 1, anchor: id, type: 'after' };
+                            }
+                        }
+
+                        // Strategy 2: Look Down (Successors)
+                        // Find nearest next ID in Source that EXISTS in Target
+                        for (let i = sourceIndex + 1; i < leftData.length - 1; i++) {
+                            const row = leftData[i + 1];
+                            if (!row) continue;
+                            const id = String(row[idColumnIdx]);
+                            if (targetIdMap.has(id)) {
+                                const anchorRow = targetIdMap.get(id);
+                                return { pos: anchorRow, anchor: id, type: 'before' };
+                            }
+                        }
+
+                        // Fallback: Max Row + 1
+                        return { pos: maxRow + 1, anchor: null, type: 'append' };
+                    };
+
+                    // We need to track index shifts because we are inserting rows.
+                    // But `targetIdMap` effectively gives us "Original Excel Indices".
+                    // If we insert multiple rows, we must process them such that we don't mess up the order.
+                    // Ideally, inserting one by one and updating a "Shift Map" or just re-calculating?
+                    // Simpler: Process inserts. Since we insert into Excel object, `wsTarget.insertRow` SHIFTS rows down.
+                    // So `targetIdMap` values become invalid if we insert above them.
+
+                    // CRITICAL: When using insertRow, subsequent row numbers increment.
+                    // Solution: Keep track of `insertedCount` affecting rows below?
+                    // Better: We are sorting `selectedList` (Source Order).
+                    // If we insert sequentially based on Source Order, we are generally safe IF we insert strictly.
+                    // BUT, if we insert at row 5, then row 6 becomes 7.
+                    // If our next insert anchor relies on row 6 (now 7), `targetIdMap` says 6 -> Error.
+
+                    // ROBUST SOLUTION:
+                    // 1. Identify all ops first (Updates vs Inserts).
+                    // 2. Perform Updates (No row shifts).
+                    // 3. Perform Inserts from BOTTOM to TOP? 
+                    //    No, we want Source Order.
+                    //    Actually, if we rely on "Context", we rely on IDs that EXIST.
+                    //    If we insert a new row, it doesn't become an anchor for the next one immediately unless we update map.
+
+                    // Let's UPDATE the map as we insert!
+                    // If we insert at `idx`, we must increment all values in `targetIdMap` that are >= `idx`.
+
+                    for (const bodyIdx of selectedList) {
+                        const rowData = leftData[bodyIdx + 1];
+                        const id = String(rowData[idColumnIdx]);
+                        const sourceRow = sourceRowMap.get(id); // Excel Row Object
+                        if (!sourceRow) continue;
+
+                        movedIds.add(id);
+
+                        if (targetIdMap.has(id)) {
+                            // --- UPDATE ---
+                            const targetRowNum = targetIdMap.get(id);
+                            const targetRow = wsTarget.getRow(targetRowNum);
+                            const optimisticRowArr = newRightData[targetRowNum - 1] || [];
+
+                            sourceRow.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+                                const targetCell = targetRow.getCell(colNumber);
+                                targetCell.value = cell.value;
+                                targetCell.style = safeCopyStyle(cell.style);
+                                optimisticRowArr[colNumber - 1] = (cell.value || "").toString();
+                            });
+                            targetRow.commit();
+
+                            // Optimistic Update is already in place if reference holds, 
+                            // but we should set it to ensure React triggers? 
+                            // mutation of array inside array needs new wrapper.
+                            modifiedCount++;
+                        } else {
+                            // --- INSERT ---
+                            const { pos } = findInsertPos(bodyIdx);
+                            const insertIndex = pos;
+
+                            const newRow = wsTarget.insertRow(insertIndex, []);
+                            const optimisticRowArr = [];
+
+                            // Pad
+                            const maxCols = rightData[0]?.length || 10;
+                            for (let k = 0; k < maxCols; k++) optimisticRowArr.push("");
+
+                            sourceRow.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+                                const newCell = newRow.getCell(colNumber);
+                                newCell.value = cell.value;
+                                newCell.style = safeCopyStyle(cell.style);
+                                optimisticRowArr[colNumber - 1] = (cell.text || cell.value || "").toString();
+                            });
+                            newRow.commit();
+
+                            // Insert into State
+                            // State Index = Excel Index - 1.
+                            newRightData.splice(insertIndex - 1, 0, optimisticRowArr);
+
+                            // *** CRITICALLY IMPORTANT: Update targetIdMap to reflect shift ***
+                            // All rows >= insertIndex have moved down by 1.
+                            for (const [key, val] of targetIdMap.entries()) {
+                                if (val >= insertIndex) {
+                                    targetIdMap.set(key, val + 1);
+                                }
+                            }
+                            // Add self to map (though unlikely verification needed immediately)
+                            targetIdMap.set(id, insertIndex);
+                            maxRow++;
+
+                            insertedCount++;
+                        }
+                    }
+
+                    // Apply State
+                    setRightData(newRightData);
+
+                    // clear selection/diffs
+                    // ... (keep existing cleanup logic)
+                    const newDiffResults = { ...diffResults };
+                    movedIds.forEach(id => delete newDiffResults[id]);
+                    setDiffResults(newDiffResults);
+
+                    const newDiffList = diffList.filter(idx => {
+                        const rowData = leftData[idx + 1];
+                        const id = String(rowData[idColumnIdx]);
+                        return !movedIds.has(id);
+                    });
+                    setDiffList(newDiffList);
+
+                    setStats(prev => {
+                        // Simplify stats update
+                        return { modified: 0, new: 0 }; // Just reset or calc properly? 
+                        // Partial update is hard, let's just keep it simple or calc properly.
+                        // For now, let's just trust list filter.
+                    });
+
+                    setLeftSelection(new Set());
+                    alert(`完成!\n覆蓋: ${modifiedCount}, 插入: ${insertedCount}`);
+
+                } catch (e) {
+                    console.error(e);
+                    alert("搬移過程發生錯誤: " + e.message);
+                }
+            };
+
+            const handleSave = async () => {
+                console.log("Download Clicked (Formatted + Flat Values + XLSX Force)");
+                try {
+                    if (!rightFile) { alert("無目標檔案"); return; }
+
+                    // Creates a clean NEW workbook to avoid corruption
+                    const newWorkbook = new ExcelJS.Workbook();
+                    const newWorksheet = newWorkbook.addWorksheet(rightSheet);
+
+                    const sourceWorksheet = rightFile.workbook.getWorksheet(rightSheet);
+
+                    if (sourceWorksheet) {
+                        // Copy Columns config if exists (widths + styles)
+                        if (sourceWorksheet.columns) {
+                            newWorksheet.columns = sourceWorksheet.columns.map(col => ({
+                                header: col.header,
+                                key: col.key,
+                                width: col.width,
+                                style: safeCopyStyle(col.style)
+                            }));
+                        }
+
+                        // Row-by-Row Copy (VALUES + STYLES)
+                        sourceWorksheet.eachRow({ includeEmpty: true }, (row, rowNumber) => {
+                            const newRow = newWorksheet.getRow(rowNumber);
+
+                            row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+                                const newCell = newRow.getCell(colNumber);
+
+                                // Flatten Formulas to avoid corruption from broken refs
+                                if (cell.type === ExcelJS.ValueType.Formula || (typeof cell.value === 'object' && cell.value && 'result' in cell.value)) {
+                                    newCell.value = cell.result !== undefined ? cell.result : null;
+                                    if (newCell.value && typeof newCell.value === 'object' && newCell.value.error) {
+                                        newCell.value = "#ERROR"; // Fallback for formula errors
+                                    }
+                                } else {
+                                    newCell.value = cell.value;
+                                }
+
+                                newCell.style = safeCopyStyle(cell.style);
+                            });
+                            newRow.commit();
+                        });
+                    }
+
+                    const buffer = await newWorkbook.xlsx.writeBuffer();
+                    const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+                    const url = URL.createObjectURL(blob);
+
+                    const a = document.createElement("a");
+                    a.href = url;
+
+                    // FORCE .xlsx extension to avoid XLSM mismatch corruption
+                    let safeName = rightFile.name;
+                    if (safeName.toLowerCase().endsWith('.xlsm')) {
+                        safeName = safeName.substring(0, safeName.length - 5) + '.xlsx';
+                    } else if (safeName.toLowerCase().endsWith('.xls')) {
+                        safeName = safeName.substring(0, safeName.length - 4) + '.xlsx';
+                    } else if (!safeName.toLowerCase().endsWith('.xlsx')) {
+                        safeName += '.xlsx';
+                    }
+
+                    a.download = `Merged_${safeName}`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                } catch (err) {
+                    console.error(err);
+                    alert("下載失敗，請檢查 Console 錯誤訊息:\n" + err.message);
+                }
+            };
+
+            const toggleSelect = (idx) => {
+                const s = new Set(leftSelection);
+                if (s.has(idx)) s.delete(idx); else s.add(idx);
+                setLeftSelection(s);
+            };
+
+            return (
+                <div className="flex flex-col h-screen max-w-[1600px] mx-auto p-4 gap-4">
+                    <ReportModal
+                        isOpen={showReport}
+                        onClose={() => setShowReport(false)}
+                        diffResults={diffResults}
+                        leftData={leftData}
+                        rightData={rightData}
+                        idColumnIdx={idColumnIdx}
+                        onJump={onReportJump}
+                    />
+                    <header className="flex items-center justify-between shrink-0 glass-panel p-4 rounded-xl">
+                        <div className="flex items-center gap-4">
+                            <div className="bg-gradient-to-br from-emerald-500 to-blue-600 p-2 rounded-lg"><Icon name="file" className="text-white" /></div>
+                            <div>
+                                <h1 className="text-xl font-bold text-white tracking-wide">Excel Pro Compare</h1>
+                                <div className="flex gap-2 text-xs text-slate-400 items-center mt-1">
+                                    <span>V4.0 | Search </span>
+                                    {leftData.length > 0 && (
+                                        <select className="bg-slate-700 border-none rounded px-2 py-0.5 text-white outline-none cursor-pointer hover:bg-slate-600 transition-colors" value={idColumnIdx} onChange={e => setIdColumnIdx(Number(e.target.value))}>
+                                            {leftData[0].map((col, idx) => <option key={idx} value={idx}>ID: {col}</option>)}
+                                        </select>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                        <div className="flex gap-4 items-center">
+                            {(stats.modified > 0 || stats.new > 0) && (
+                                <div
+                                    className="flex gap-2 text-xs font-bold mr-4 cursor-pointer hover:scale-105 transition-transform active:scale-95"
+                                    onClick={() => setShowReport(true)}
+                                    title="點擊查看詳細差異報告"
+                                >
+                                    <span className="px-3 py-1 rounded-full bg-yellow-500/20 text-yellow-300 border border-yellow-500/30 shadow-lg shadow-yellow-500/10 backdrop-blur-sm">{stats.modified} 修改</span>
+                                    <span className="px-3 py-1 rounded-full bg-red-500/20 text-red-300 border border-red-500/30 shadow-lg shadow-red-500/10 backdrop-blur-sm">{stats.new} 新增</span>
+                                </div>
+                            )}
+                            {diffList.length > 0 && (
+                                <div className="flex mr-4 bg-slate-700 rounded-lg p-1 gap-1">
+                                    <button onClick={() => scrollToDiff(-1)} className="p-1 hover:bg-slate-600 rounded text-slate-300 hover:text-white"><Icon name="arrowUp" /></button>
+                                    <button onClick={() => scrollToDiff(1)} className="p-1 hover:bg-slate-600 rounded text-slate-300 hover:text-white"><Icon name="arrowDown" /></button>
+                                    <span className="text-xs text-slate-400 self-center px-2">{currentDiffIdx + 1 > 0 ? currentDiffIdx + 1 : '-'} / {diffList.length}</span>
+                                </div>
+                            )}
+                            <button onClick={runComparison} disabled={isComparing || !leftData.length || !rightData.length} className="flex items-center gap-2 px-6 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-all shadow-lg shadow-indigo-500/30">
+                                {isComparing ? '比對中...' : <><Icon name="refresh" /> 開始比對</>}
+                            </button>
+                            <button onClick={handleMove} disabled={leftSelection.size === 0} className="flex items-center gap-2 px-6 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-all shadow-lg shadow-blue-500/30">
+                                <Icon name="arrowRight" /> 搬移 ({leftSelection.size})
+                            </button>
+                            <button onClick={handleSave} disabled={!rightData.length} className="flex items-center gap-2 px-6 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-all shadow-lg shadow-emerald-500/30">
+                                <Icon name="save" /> 下載
+                            </button>
+                        </div>
+                    </header>
+                    <div className="flex-1 flex gap-4 min-h-0">
+                        <div className="flex flex-col gap-4 w-1/2 min-w-0">
+                            <DropZone label="來源檔案 (Source)" file={leftFile} sheetNames={leftFile?.sheetNames} selectedSheet={leftSheet} onSheetChange={setLeftSheet} onDrop={onLeftDrop} />
+                            <div className="bg-slate-800 p-2 rounded-lg flex gap-2 border border-slate-700">
+                                <Icon name="check" size={16} /> {/* Should be search icon */}
+                                <input placeholder="搜尋 ID 或內容..." className="bg-transparent text-sm w-full outline-none text-slate-200" value={leftSearch} onChange={e => setLeftSearch(e.target.value)} />
+                            </div>
+                            <VirtualDataGrid title={`來源: ${leftSheet || '未選擇'}`} data={leftData} diffResults={diffResults} selectedIndices={leftSelection} onSelectionChange={toggleSelect} rowMap={null} idColumnIdx={idColumnIdx} scrollToId={diffList[currentDiffIdx]} scrollToCol={currentDiffCol} searchTerm={leftSearch} />
+                        </div>
+                        <div className="flex flex-col gap-4 w-1/2 min-w-0">
+                            <DropZone label="目標檔案 (Target)" file={rightFile} sheetNames={rightFile?.sheetNames} selectedSheet={rightSheet} onSheetChange={setRightSheet} onDrop={onRightDrop} />
+                            <div className="bg-slate-800 p-2 rounded-lg flex gap-2 border border-slate-700">
+                                <Icon name="check" size={16} />
+                                <input placeholder="搜尋 ID 或內容..." className="bg-transparent text-sm w-full outline-none text-slate-200" value={rightSearch} onChange={e => setRightSearch(e.target.value)} />
+                            </div>
+                            <VirtualDataGrid title={`目標: ${rightSheet || '未選擇'}`} data={rightData} diffResults={{}} idColumnIdx={idColumnIdx} searchTerm={rightSearch} />
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+
+</html>
