@@ -224,12 +224,16 @@
 
             // Handle Resize
             useEffect(() => {
-                const updateHeight = () => {
-                    if (containerRef.current) setContainerHeight(containerRef.current.clientHeight);
-                };
-                window.addEventListener('resize', updateHeight);
-                updateHeight();
-                return () => window.removeEventListener('resize', updateHeight);
+                const observer = new ResizeObserver((entries) => {
+                    for (let entry of entries) {
+                        // Fix for decimal heights and padding
+                        setContainerHeight(entry.contentRect.height);
+                    }
+                });
+                if (containerRef.current) {
+                    observer.observe(containerRef.current);
+                }
+                return () => observer.disconnect();
             }, []);
 
             // Handle Scroll
@@ -284,10 +288,12 @@
             const totalRows = body.length;
 
             // Virtualization Calculations
-            const limit = Math.ceil(containerHeight / ROW_HEIGHT) + 5; // Buffer
+            const overscan = 20; // Number of extra rows to render above and below visible area
             const startNode = Math.floor(scrollTop / ROW_HEIGHT);
-            const start = Math.max(0, startNode - 5); // Buffer
-            const end = Math.min(totalRows, start + limit);
+            const visibleNodesCount = Math.ceil(containerHeight / ROW_HEIGHT);
+
+            const start = Math.max(0, startNode - overscan);
+            const end = Math.min(totalRows, startNode + visibleNodesCount + overscan);
 
             const visibleRows = body.slice(start, end);
             const paddingTop = start * ROW_HEIGHT;
@@ -318,7 +324,7 @@
                     </div>
 
                     {/* Virtual Scroll Body */}
-                    <div ref={containerRef} onScroll={handleScroll} className="overflow-auto scroll-custom flex-1 relative">
+                    <div ref={containerRef} onScroll={handleScroll} className="overflow-auto scroll-custom flex-1 relative pb-4">
                         {/* Simulation Container */}
                         <table className="fixed-table text-sm text-left" style={{ marginTop: paddingTop, marginBottom: paddingBottom }}>
                             <tbody>
